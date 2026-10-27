@@ -32,6 +32,8 @@ EVENTS_URL = os.environ.get("EVENTS_URL", "").rstrip("/")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("orders")
 payment_slots = threading.Semaphore(2)
+processing_orders = set()
+processing_lock = threading.Lock()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
@@ -42,10 +44,12 @@ CREATE TABLE IF NOT EXISTS orders (
     items        JSONB NOT NULL,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE TABLE IF NOT EXISTS bonuses (
-    user_id TEXT PRIMARY KEY,
-    points  BIGINT NOT NULL
-)
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS event_sent BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE TABLE IF NOT EXISTS bonus_events (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    bonus_points BIGINT NOT NULL
+);
 """
 
 
@@ -156,11 +160,29 @@ def process_order(order_id, items, amount):
             "UPDATE orders SET status = %s WHERE id = %s",
             (status, order_id)
         )
-
     log.info("order %s: %s", order_id, status)
 
-    if status == "paid":
-        publish_paid(order_id)
+def pending_worker():
+    while True:
+        try:
+            with db() as conn:
+                orders = conn.execute("SELECT id, items, amount_cents FROM orders WHERE status = 'pending'").fetchall()
+            for order in orders:
+                with processing_lock:
+                    if order[0] in processing_orders:
+                        continue
+                    processing_orders.add(order[0])
+                try:
+                    process_order(*order)
+                finally:
+                    with processing_lock:
+                        processing_orders.discard(order[0])
+                break
+            time.sleep(0.2)
+        except Exception:
+            log.exception("ошибка обработки заказа")
+            time.sleep(1)
+
 
 def create_order(body):
     order_id = str(uuid.uuid4())
@@ -171,13 +193,6 @@ def create_order(body):
             "INSERT INTO orders (id, user_id, status, amount_cents, items) VALUES (%s, %s, %s, %s, %s)",
             (order_id, body["user_id"], "pending", amount, json.dumps(body["items"]))
         )
-
-    threading.Thread(
-        target=process_order,
-        args=(order_id, body["items"], amount),
-        daemon=True
-    ).start()
-
     return {"id": order_id, "status": "pending"}
 
 
@@ -187,32 +202,46 @@ def publish_paid(order_id):
         return
     try:
         code, _ = call("POST", f"{EVENTS_URL}/events", {
-            "id": str(uuid.uuid4()),
+            "id": order_id,
             "type": "order.paid",
             "order_id": order_id,
-            "occurred_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         })
-        if code != 202:
-            log.warning("order %s: событие не опубликовано (%s)", order_id, code)
-    except OSError as e:
-        log.warning("order %s: событие не опубликовано (%s)", order_id, e)
+        if code == 202:
+            with db() as conn:
+                conn.execute("UPDATE orders SET event_sent = TRUE WHERE id = %s", (order_id,))
+        else:
+            log.warning("order %s: событие не отправлено (%s)", order_id, code)
+    except Exception as e:
+        log.warning("order %s: ошибка отправки события (%s)", order_id, e)
 
+def retry_events():
+    while True:
+        try:
+            with db() as conn:
+                rows = conn.execute("SELECT id FROM orders WHERE status = 'paid' AND event_sent = FALSE").fetchall()
+
+            for row in rows:
+                publish_paid(row[0])
+
+        except Exception as e:
+            log.warning("ошибка проверки событий: %s", e)
+
+        time.sleep(1)
 
 def delivery_confirmed(event):
     """Начисляет бонусы за подтверждённую доставку."""
     with db() as conn:
         conn.execute(
-            "INSERT INTO bonuses (user_id, points) VALUES (%s, %s) "
-            "ON CONFLICT (user_id) DO UPDATE SET points = bonuses.points + EXCLUDED.points",
-            (event["user_id"], event["bonus_points"]),
+            "INSERT INTO bonus_events (id, user_id, bonus_points) VALUES (%s, %s, %s) "
+            "ON CONFLICT (id) DO NOTHING",
+            (event["id"], event["user_id"], event["bonus_points"])
         )
 
 
 def get_bonus(user_id):
     with db() as conn:
-        row = conn.execute("SELECT points FROM bonuses WHERE user_id = %s", (user_id,)).fetchone()
-    return {"points": row[0] if row else 0}
-
+        row = conn.execute("SELECT COALESCE(SUM(bonus_points), 0) FROM bonus_events WHERE user_id = %s", (user_id,)).fetchone()
+    return {"points": int(row[0])}
 
 def get_order(order_id):
     with db() as conn:
@@ -288,6 +317,10 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
+    for _ in range(4):
+        threading.Thread(target=pending_worker, daemon=True).start()
+    if EVENTS_URL:
+        threading.Thread(target=retry_events, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True
     log.info("orders: слушаю :%d", PORT)
